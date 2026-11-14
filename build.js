@@ -62,7 +62,7 @@ let warnings = 0;
 const warn = (msg) => { warnings++; console.warn(`warning: ${msg}`); };
 
 // Every source file must be listed, so nothing is silently left out
-const listed = new Set(["header.js", ...CORE_FILES.flatMap(expand), ...CSS_FILES, ...CARD_FILES]);
+const listed = new Set(["header.js", "lazy/loader.js", ...CORE_FILES.flatMap(expand), ...CSS_FILES, ...CARD_FILES]);
 const walk = (dir) => fs.readdirSync(path.join(SRC, dir), { withFileTypes: true }).flatMap((e) =>
   e.isDirectory() ? walk(`${dir}${e.name}/`) : [`${dir}${e.name}`]);
 for (const f of walk("").filter((f) => /\.(js|css)$/.test(f) && !listed.has(f))) warn(`src/${f} is not listed in build.js`);
@@ -97,13 +97,73 @@ if (cssMarkers !== 1) throw new Error(`expected one /*@css*/\`\` marker, found $
 out = out.replace("/*@css*/``", () => "`\n" + css + "`");
 
 const used = new Set();
-out = out.replace(/^([ \t]*)(.*?)\/\*@i18n (\w+)\*\/\{\}/gm, (_, indent, before, ns) => {
+const inlineI18n = (text) => text.replace(/^([ \t]*)(.*?)\/\*@i18n (\w+)\*\/\{\}/gm, (_, indent, before, ns) => {
   if (!i18n.en[ns]) throw new Error(`namespace "${ns}" missing from src/i18n/en.json`);
   used.add(ns);
   const table = Object.fromEntries(langs.filter((l) => i18n[l][ns]).map((l) => [l, i18n[l][ns]]));
   return indent + before + JSON.stringify(table, null, 2).replace(/\n/g, `\n${indent}`);
 });
+out = inlineI18n(out);
 for (const ns of Object.keys(i18n.en).filter((ns) => !used.has(ns))) warn(`en.json: namespace "${ns}" is not used by the source`);
+
+/* ---- lazy build (--lazy [--out dir]) : un petit chargeur + un fichier par carte ----
+ * Le chargeur déclare chaque carte sous forme de « souche » (liste produite en exécutant les morceaux dans un bac à sable)
+ * et ne télécharge le code d'une carte que lorsqu'elle s'affiche. Les morceaux sont à plat, à côté du chargeur. */
+const buildLazy = (check = false, dir = null) => {
+  const vm = require("vm");
+  const oi = process.argv.indexOf("--out");
+  const outDir = dir || path.resolve(ROOT, oi > 0 ? process.argv[oi + 1] : "dist-lazy");
+  const version = /const VERSION = "([^"]+)"/.exec(load("core/version.js"))[1];
+  const sub = (code) => inlineI18n(code);
+  // morceaux : shared (aides communes des cartes), core (cartes de base), puis une carte par fichier
+  const parts = [["shared", ["card-helpers", "editor-labels"].map((n) => load(`cards/${n}.js`)).join("\n")],
+    ["core", '"use strict";\n' + CORE_FILES.flatMap(expand).map(load).join("\n").replace("/*@css*/``", () => "`\n" + css + "`") + `console.info("%c HA-APPLIANCE-CARDS %c v${version} ", "color:#fff;background:#03a9f4;font-weight:700;border-radius:3px 0 0 3px", "color:#03a9f4;background:#fff;font-weight:700;border-radius:0 3px 3px 0");\n`],
+    ...CARD_FILES.filter((f) => !/card-helpers|editor-labels/.test(f)).map((f) => [path.basename(f, ".js"), load(f)])]
+    .map(([n, code]) => [n, sub(code)]);
+  // le code core fait console.info en fin de register.js : le chargeur s'en charge, on retire le doublon
+  const parts2 = parts.map(([n, code]) => [n, n === "core" ? code.replace(/console\.info\(`%c HA-APPLIANCE-CARDS[\s\S]*?\);\n/, "").replace(/console\.info\("%c HA-APPLIANCE-CARDS[\s\S]*?\);\n$/, "") : code]);
+
+  // exécution dans un bac à sable : relève les éléments déclarés et les fiches du sélecteur par morceau
+  const deep = () => new Proxy(function () {}, { get: (t, k) => (k === Symbol.toPrimitive ? () => "" : deep()), apply: () => deep(), construct: () => deep(), set: () => true, has: () => true });
+  const ctx = { console: { info() {}, log() {}, warn() {}, error() {} }, HTMLElement: class {}, customCards: undefined, Intl, JSON, Math, Date, Object, Array, String, Number, Promise, Set, Map, WeakMap, Symbol, RegExp, Error, URL,
+    setTimeout() {}, setInterval() {}, clearTimeout() {}, clearInterval() {}, requestAnimationFrame() {}, cancelAnimationFrame() {} };
+  for (const k of ["document", "navigator", "localStorage", "sessionStorage", "location", "matchMedia", "getComputedStyle", "CustomEvent", "Event", "ResizeObserver", "IntersectionObserver", "MutationObserver", "fetch", "performance", "CSS", "DOMParser", "Image"]) ctx[k] = deep();
+  ctx.window = ctx; ctx.globalThis = ctx;
+  vm.createContext(ctx);
+  ctx.customCards = [];
+  const manifest = { chunks: {}, cards: [], tags: [] };
+  for (const [n, code] of parts2) {
+    const defined = [];
+    const ce = { define: (name) => defined.push(name), get: () => undefined, whenDefined: () => Promise.resolve() };
+    const before = ctx.customCards.length;
+    try { vm.runInContext(`((customElements) => {\n${code}\n})`, ctx, { filename: `${n}.js` })(ce); }
+    catch (e) { throw new Error(`lazy build: « ${n} » ne s'exécute pas dans le bac à sable : ${e.message}`); }
+    const tags = defined.filter((t) => !t.endsWith("-editor"));
+    if (tags.length) manifest.chunks[n] = tags;
+    manifest.tags.push(...tags);
+    manifest.cards.push(...ctx.customCards.slice(before).map((c) => JSON.parse(JSON.stringify(c))));
+  }
+  const isOurs = (f) => f.startsWith("ha-appliance-electromenager-cards") && f.endsWith(".js");
+  const files = {};
+  for (const [n, code] of parts2) files[n === "shared" || manifest.chunks[n] ? `ha-appliance-electromenager-cards.${n}.js` : null] = `export default (customElements) => {\n${code}\n};\n`;
+  delete files.null;
+  files["ha-appliance-electromenager-cards.js"] = load("header.js") + load("lazy/loader.js")
+    .replace('"/*@version*/"', JSON.stringify(version)).replace("/*@manifest*/{}", () => JSON.stringify(manifest));
+  if (check) {
+    const have = fs.existsSync(outDir) ? fs.readdirSync(outDir).filter(isOurs) : [];
+    const bad = Object.keys(files).filter((f) => !have.includes(f) || read(path.join(outDir, f)) !== files[f]).concat(have.filter((f) => !(f in files)));
+    if (bad.length) { console.error(`${path.relative(ROOT, outDir)}/ is out of date (${bad.slice(0, 5).join(", ")}…): run \`node build.js --lazy --out ${path.relative(ROOT, outDir)}\` and commit the result.`); process.exit(1); }
+    console.log(`${path.relative(ROOT, outDir)}/ (lazy build) is up to date.`); return;
+  }
+  fs.mkdirSync(outDir, { recursive: true });
+  for (const f of fs.readdirSync(outDir).filter(isOurs)) fs.unlinkSync(path.join(outDir, f));
+  for (const [f, c] of Object.entries(files)) fs.writeFileSync(path.join(outDir, f), c);
+  const kb = (s) => `${(Buffer.byteLength(s) / 1024).toFixed(0)} Ko`;
+  console.log(`built lazy ${path.relative(ROOT, outDir)}/: loader ${kb(files["ha-appliance-electromenager-cards.js"])}, ${Object.keys(files).length - 1} chunks, ${manifest.tags.length} cards`);
+};
+// dist/ déjà au format « à la demande » (chargeur + morceaux) : --check le compare à un build lazy
+const lazyDist = fs.existsSync(DIST) && read(DIST).includes("__applianceLazy");
+if (process.argv.includes("--lazy") || (process.argv.includes("--check") && lazyDist)) { buildLazy(process.argv.includes("--check"), lazyDist ? path.dirname(DIST) : null); process.exit(0); }
 
 if (process.argv.includes("--check")) {
   const current = fs.existsSync(DIST) ? read(DIST) : "";

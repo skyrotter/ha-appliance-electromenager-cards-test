@@ -47,3 +47,17 @@ src/
 Language resolution is shared by core cards, standalone cards, editors and the picker through `window.applianceResolveLanguage`. It preserves regional variants, accepts case and underscore variations, maps generic `pt` to `pt-PT`, retains Norwegian aliases and Serbian Latin, and falls back to English for unsupported languages.
 
 After editing either Portuguese file, run `node tests/portuguese.cjs`, rebuild, and run `node build.js --check`. Open `docs/tests.html` through a local HTTP server for the browser regression suite. The demo discovers both Portuguese variants automatically from the built card schemas; select each language to inspect card names, states, alerts and longer labels at narrow widths.
+
+## Lazy loading build (test)
+
+`dist/ha-appliance-electromenager-cards.js` holds all the cards (about 5.6 MB). The lazy build replaces it with a small loader (about 100 KB) plus one file per card, next to it in `dist/`. A card's file is only downloaded when the card is displayed in a dashboard or in the editor.
+
+```sh
+node build.js --lazy --out dist   # loader + chunks in dist/ (replaces the single file)
+node build.js --lazy              # same, in dist-lazy/ (not committed), to try it locally
+node build.js --check             # detects a lazy dist/ and checks it
+```
+
+- `ha-appliance-electromenager-cards.js` is the loader, so the Lovelace resource and HACS keep working unchanged. `.shared.js` (common helpers), `.core.js` (the base cards) and `.<card>.js` are fetched from the same folder, with `?v=<version>` to bypass the browser cache after an update.
+- The loader declares every card as a stub element, so Home Assistant sees them all immediately (card picker, editor). When a card is needed, the stub loads its chunk and takes over the real class.
+- Test it on a pre-release first (tag `vX.Y.Z-beta1` from a branch with the lazy `dist/`): the release workflow attaches every `dist/*.js` file, then add the repository to HACS as a custom repository with « Show beta versions ». Check that HACS downloads all the files of `dist/`.
